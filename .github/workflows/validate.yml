@@ -1,0 +1,21 @@
+name: Container correctness
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - name: Build linux/amd64 image
+        run: docker build --platform linux/amd64 -t shopping-sessions:latest .
+      - name: Run all 36 fixtures with scorer sandbox flags
+        env:
+          CPUS: '2'
+          MEM: 6g
+        run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
