@@ -1,0 +1,32 @@
+[
+  {
+    "version": "native-v4",
+    "seconds": 5.478950787000031,
+    "returncode": 0
+  },
+  {
+    "version": "native-v5",
+    "seconds": 2.60788661100014,
+    "returncode": 0
+  },
+  {
+    "version": "native-v5",
+    "seconds": 2.5678553589996227,
+    "returncode": 0
+  },
+  {
+    "version": "native-v4",
+    "seconds": 3.51504860499972,
+    "returncode": 0
+  },
+  {
+    "version": "native-v4",
+    "seconds": 3.1740933390001373,
+    "returncode": 0
+  },
+  {
+    "version": "native-v5",
+    "seconds": 2.632370692999757,
+    "returncode": 0
+  }
+]

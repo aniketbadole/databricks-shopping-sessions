@@ -107,8 +107,11 @@ bool parse(SV s, SV *a, int n) {
     __m128i v =
         _mm_loadu_si128(reinterpret_cast<const __m128i *>(s.data() + i));
     unsigned c = _mm_movemask_epi8(_mm_cmpeq_epi8(v, comma));
-    unsigned q = _mm_movemask_epi8(_mm_cmpeq_epi8(v, quote));
-    quotes += __builtin_popcount(q);
+    __m128i quoted_bytes =
+        _mm_and_si128(_mm_cmpeq_epi8(v, quote), _mm_set1_epi8(1));
+    __m128i sums = _mm_sad_epu8(quoted_bytes, _mm_setzero_si128());
+    quotes += int(_mm_cvtsi128_si64(sums) +
+                  _mm_cvtsi128_si64(_mm_srli_si128(sums, 8)));
     while (c) {
       if (count >= n - 1)
         return false;
@@ -143,12 +146,24 @@ bool parse(SV s, SV *a, int n) {
   return quotes == allowed;
 }
 
-I days(int y, unsigned m, unsigned d) {
+I days_slow(int y, unsigned m, unsigned d) {
   y -= m <= 2;
   int era = (y >= 0 ? y : y - 399) / 400;
   unsigned yo = y - era * 400;
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
   return I(era) * 146097 + I(yo) * 365 + yo / 4 - yo / 100 + doy - 719468;
+}
+I days(int y, unsigned m, unsigned d) {
+  struct Month {
+    uint32_t key = 0;
+    I start = 0;
+  };
+  static thread_local array<Month, 64> cache{};
+  uint32_t key = uint32_t(y) * 16 + m;
+  auto &entry = cache[(uint32_t(y) * 12 + m) & 63];
+  if (entry.key != key)
+    entry = {key, days_slow(y, m, 1)};
+  return entry.start + d - 1;
 }
 bool digits(SV s) {
   if (s.empty())
@@ -161,12 +176,12 @@ bool digits(SV s) {
 I number(SV s, I limit) {
   if (s.empty())
     return -1;
-  I n = 0;
+  I n = 0, quotient = limit / 10, remainder = limit % 10;
   for (char c : s) {
     int d = c - '0';
     if (d < 0 || d > 9)
       return -1;
-    if (n > (limit - d) / 10)
+    if (n > quotient || (n == quotient && d > remainder))
       return -1;
     n = n * 10 + d;
     if (n > limit)
@@ -175,23 +190,22 @@ I number(SV s, I limit) {
   return n;
 }
 I stamp(SV s) {
-  if (digits(s))
+  if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
     return number(s, numeric_limits<I>::max());
-  if (s.size() != 20 && s.size() != 25)
+  if (s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':')
     return -1;
-  if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' ||
-      s[16] != ':')
+  auto two = [&](int p) {
+    unsigned a = unsigned(s[p] - '0'), b = unsigned(s[p + 1] - '0');
+    return a > 9 || b > 9 ? -1 : int(a * 10 + b);
+  };
+  int y0 = two(0), y1 = two(2), m = two(5), d = two(8), h = two(11),
+      mi = two(14), se = two(17);
+  if (y0 < 0 || y1 < 0 || m < 1 || m > 12 || d < 1 || unsigned(h) > 23 ||
+      unsigned(mi) > 59 || unsigned(se) > 59)
     return -1;
-  int y = number(s.substr(0, 4), 9999), m = number(s.substr(5, 2), 99),
-      d = number(s.substr(8, 2), 99), h = number(s.substr(11, 2), 99),
-      mi = number(s.substr(14, 2), 99), se = number(s.substr(17, 2), 99);
-  if (y < 0 || m < 1 || m > 12 || d < 1 || h < 0 || h > 23 || mi < 0 ||
-      mi > 59 || se < 0 || se > 59)
-    return -1;
-  static const int md[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  int maxd =
-      md[m - 1] + (m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-  if (d > maxd)
+  int y = y0 * 100 + y1;
+  static constexpr int md[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (d > md[m - 1] + (m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)))
     return -1;
   I offset = 0;
   if (s.size() == 20) {
@@ -200,8 +214,8 @@ I stamp(SV s) {
   } else {
     if ((s[19] != '+' && s[19] != '-') || s[22] != ':')
       return -1;
-    int oh = number(s.substr(20, 2), 99), om = number(s.substr(23, 2), 99);
-    if (oh < 0 || oh > 23 || om < 0 || om > 59)
+    int oh = two(20), om = two(23);
+    if (unsigned(oh) > 23 || unsigned(om) > 59)
       return -1;
     offset = (oh * 60 + om) * 60000LL;
     if (s[19] == '-')
@@ -238,18 +252,25 @@ struct IdCodec {
   uint64_t encode(SV s) {
     uint64_t value = 0;
     if (s.size() <= 10) {
+      static constexpr auto table = []() {
+        array<unsigned char, 256> t{};
+        for (int c = '0'; c <= '9'; c++)
+          t[c] = c - '0' + 1;
+        for (int c = 'A'; c <= 'Z'; c++)
+          t[c] = c - 'A' + 11;
+        for (int c = 'a'; c <= 'z'; c++)
+          t[c] = c - 'a' + 37;
+        t['_'] = 63;
+        return t;
+      }();
+      unsigned invalid = 0;
       for (unsigned char c : s) {
-        unsigned d = c >= '0' && c <= '9'   ? c - '0' + 1
-                     : c >= 'A' && c <= 'Z' ? c - 'A' + 11
-                     : c >= 'a' && c <= 'z' ? c - 'a' + 37
-                     : c == '_'             ? 63
-                                            : 0;
-        if (!d) {
-          value = 0;
-          break;
-        }
+        unsigned d = table[c];
+        invalid |= (d == 0);
         value = (value << 6) | d;
       }
+      if (invalid)
+        value = 0;
       if (value)
         return value;
     }
@@ -370,8 +391,17 @@ struct DSU {
   }
   Person person(SV s) const {
     uint64_t id = codec.encode(s);
+    struct Entry {
+      uint64_t key = 0, value = 0;
+    };
+    static thread_local array<Entry, 8192> cache{};
+    auto &entry = cache[mix(id) & (cache.size() - 1)];
+    if (entry.key == id)
+      return Person(entry.value);
     auto it = ids.find(id);
-    return Person(it ? canonical[*it] : id);
+    uint64_t value = it ? canonical[*it] : id;
+    entry = {id, value};
+    return Person(value);
   }
 };
 struct Event {
@@ -496,7 +526,19 @@ int main(int argc, char **argv) {
       threads = max(1, min(8, atoi(p)));
     omp_set_num_threads(threads);
     DSU dsu;
-    for (auto f : files(data / "links"))
+    auto link_files = files(data / "links");
+    size_t link_bytes = 0;
+    for (auto f : link_files)
+      link_bytes += f.size();
+    size_t expected_ids = min<size_t>(link_bytes / 12 + 16, 10000000),
+           table_size = 1024;
+    while (table_size * 7 < expected_ids * 10)
+      table_size *= 2;
+    dsu.ids.table.resize(table_size);
+    dsu.parent.reserve(expected_ids);
+    dsu.sz.reserve(expected_ids);
+    dsu.names.reserve(expected_ids);
+    for (auto f : link_files)
       lines(f, [&](SV l) {
         SV a[2];
         if (parse(l, a, 2) && !a[0].empty() && !a[1].empty())
@@ -535,6 +577,14 @@ int main(int argc, char **argv) {
     };
     using RawBuckets = array<vector<Candidate>, B>;
     vector<RawBuckets> raw(threads);
+    size_t input_bytes = 0;
+    for (auto f : ef)
+      input_bytes += f.size();
+    size_t reserve_per_bucket =
+        min<size_t>(input_bytes / 90, 100000000) / (threads * B);
+    for (auto &worker : raw)
+      for (auto &bucket : worker)
+        bucket.reserve(reserve_per_bucket);
     // Divide on physical line boundaries, not files, to balance skewed shards.
     auto chunks = [](const vector<SV> &fs) {
       vector<SV> result;
@@ -632,10 +682,11 @@ int main(int argc, char **argv) {
     log("events parsed/deduplicated");
     using ClickBuckets = array<vector<Click>, B>;
     vector<ClickBuckets> cl(threads);
+    auto click_work = chunks(cf);
 #pragma omp parallel for schedule(dynamic)
-    for (size_t f = 0; f < cf.size(); f++) {
+    for (size_t f = 0; f < click_work.size(); f++) {
       auto &dest = cl[omp_get_thread_num()];
-      lines(cf[f], [&](SV l) {
+      auto consume = [&](SV l) {
         SV a[4];
         if (!parse(l, a, 4) || a[0].empty() || a[1].empty())
           return;
@@ -647,15 +698,34 @@ int main(int argc, char **argv) {
           return;
         Person u = dsu.person(a[1]);
         dest[mix(u.hash) % B].push_back({u, a[0], t, it->second});
-      });
+      };
+      SV input = click_work[f];
+      while (!input.empty()) {
+        size_t len = input.find('\n');
+        if (len == SV::npos)
+          len = input.size();
+        consume(input.substr(0, len));
+        input.remove_prefix(min(len + 1, input.size()));
+      }
     }
     log("clicks parsed");
     // Duplicate clicks are identical: their multiplicity cannot affect
     // last-touch or the set of active campaigns. Avoid an unnecessary global
     // click-ID dedup.
     array<Totals, B> totals;
+    I first_day = start / DAY, day_count = (end - 1) / DAY - first_day + 1;
+    bool dense_mode =
+        day_count > 0 && uint64_t(day_count) * campaigns.size() <= 250000;
+    array<vector<Counts>, B> dense;
 #pragma omp parallel for schedule(dynamic)
     for (int b = 0; b < B; b++) {
+      if (dense_mode)
+        dense[b].resize(size_t(day_count) * campaigns.size());
+      auto campaign_total = [&](uint32_t id, I day) -> Counts & {
+        if (dense_mode)
+          return dense[b][size_t(day - first_day) * campaigns.size() + id];
+        return totals[b][key(id, day)];
+      };
       vector<Event> e;
       vector<Click> c;
       size_t ne = 0, nc = 0;
@@ -685,7 +755,8 @@ int main(int argc, char **argv) {
       arrow::Date32Builder out_day;
       arrow::Int64Builder out_sessions, out_events, out_revenue;
       vector<uint32_t> count(campaigns.size(), 0);
-      unordered_set<uint32_t> active;
+      vector<uint32_t> active, position(campaigns.size());
+      active.reserve(campaigns.size());
       vector<I> category(cats.size(), 0);
       size_t ci = 0;
       for (size_t u = 0; u < e.size();) {
@@ -743,21 +814,27 @@ int main(int argc, char **argv) {
           rev += revenue;
           while (right < ce && c[right].ts <= t) {
             uint32_t k = c[right++].campaign;
-            if (count[k]++ == 0)
-              active.insert(k);
+            if (count[k]++ == 0) {
+              position[k] = active.size();
+              active.push_back(k);
+            }
           }
           while (left < right && c[left].ts < t - WEEK) {
             uint32_t k = c[left++].campaign;
-            if (--count[k] == 0)
-              active.erase(k);
+            if (--count[k] == 0) {
+              uint32_t at = position[k], last = active.back();
+              active[at] = last;
+              position[last] = at;
+              active.pop_back();
+            }
           }
           uint32_t credit = left < right ? c[right - 1].campaign : 0;
-          auto &v = totals[b][key(credit, day)];
+          auto &v = campaign_total(credit, day);
           v.sessions++;
           v.purchasing += revenue > 0;
           v.revenue += revenue;
           for (uint32_t k : active)
-            totals[b][key(k, day)].assists++;
+            campaign_total(k, day).assists++;
           s = se;
         }
         flush();
@@ -780,6 +857,14 @@ int main(int argc, char **argv) {
     }
     log("sessions/attribution aggregated");
     Totals total;
+    if (dense_mode)
+      for (auto &part : dense)
+        for (size_t i = 0; i < part.size(); i++) {
+          const auto &v = part[i];
+          if (v.sessions || v.assists)
+            total[key(i % campaigns.size(),
+                      first_day + i / campaigns.size())] += v;
+        }
     for (auto &t : totals)
       for (auto &[k, v] : t)
         total[k] += v;

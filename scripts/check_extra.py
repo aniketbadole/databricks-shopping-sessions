@@ -29,3 +29,9 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run([str(root/'core'),str(data),str(base/'actual')],check=True)
     subprocess.run([sys.executable,str(root/'scripts/reference.py'),str(data),str(base/'expected')],check=True)
     subprocess.run([sys.executable,str(root/'scripts/compare.py'),str(base/'actual'),str(base/'expected')],check=True)
+
+    # A very wide reporting window exercises sparse campaign/day counters.
+    (data/'manifest.json').write_text(json.dumps({'window_start':'2026-10-01T00:00:00Z','window_end':'3000-10-15T00:00:00Z'}))
+    subprocess.run([str(root/'core'),str(data),str(base/'wide-actual')],check=True)
+    subprocess.run([sys.executable,str(root/'scripts/reference.py'),str(data),str(base/'wide-expected')],check=True)
+    subprocess.run([sys.executable,str(root/'scripts/compare.py'),str(base/'wide-actual'),str(base/'wide-expected')],check=True)

@@ -5,6 +5,46 @@ resolves linked people, deduplicates events, forms sessions, computes credit
 and assists, and writes DATE-typed Parquet directly with Apache Arrow/Parquet.
 The runtime image contains **no Python interpreter** and uses no intermediate CSVs.
 
+## Next optimization after the official 3.78 s score
+
+The previous native commit `dd32aae75b8177fd855b8bf9b23289c9940f8022` scored
+**3.78 seconds** officially (user-reported result). This revision is not yet scored.
+
+Changes in this revision:
+
+- An 8,192-entry per-worker cache resolves repeated user IDs against the immutable
+  link map. Exact ID equality is checked on every cache hit.
+- A character lookup table avoids unpredictable branches in lossless ID encoding.
+- Fixed-position timestamp parsing and a small month cache reduce repeated date
+  arithmetic while retaining calendar, ASCII-digit and overflow validation.
+- Click input is split into balanced chunks, just like event input.
+- Initial buffer capacities are estimated to avoid repeated growth and copying;
+  estimates affect allocation only, never parsing or correctness.
+- Campaign/day counters use dense arrays when their dimensions fit a bounded
+  size, with the existing hash-map fallback for wider windows.
+- The active campaign set uses a compact vector and indexed swap removal instead
+  of allocating hash-set nodes. Per-campaign reference counts remain unchanged.
+- Quote counting uses SSE2 byte sums, avoiding per-vector popcount helper calls.
+
+Final alternating 20M timings in this session:
+
+| Version | Runs (seconds) | Median |
+| --- | --- | ---: |
+| Previous native source | 5.479, 3.515, 3.174 | 3.515 s |
+| This revision | 2.608, 2.568, 2.632 | 2.608 s |
+
+This is approximately **26% less local elapsed time**. The older runs show
+substantial cache/timing variability; an official practice run is needed to
+measure the actual gain. All 36 fixtures, the exact dev answer and additional
+identifier/wide-window oracle tests pass. The wide-window test explicitly
+exercises the sparse campaign-counter fallback.
+
+The final 60M seed-29 run completed in **13.105 s** with **7,070.6 MiB peak
+child process RSS**. Its complete output exactly matched the preceding native
+version: **6,639,553 user rows** and **28,014 campaign rows**, with no missing,
+extra, differing or duplicate-key rows. This validates the changes relative to
+the preceding version; it is not an independent oracle for the 60M dataset.
+
 ## Current implementation
 
 - **Lossless compact IDs.** IDs of up to ten ASCII letters, digits or underscores
@@ -105,8 +145,9 @@ Official user-reported practice scores:
 | --- | ---: |
 | `007005d66c62cf79ce4905dc6e1198c9556ccd09` | 10.07 s |
 | `fb17dddd1b2405c0d0b9fccf1e8006e465ff748c` | 6.68 s |
+| `dd32aae75b8177fd855b8bf9b23289c9940f8022` | 3.78 s |
 
-Local alternating 20M benchmark runs in the same session:
+Historical native-rewrite benchmarks (before the latest revision):
 
 | Implementation | Runs (seconds) | Median |
 | --- | --- | ---: |
@@ -126,7 +167,7 @@ on this approximately 9.7 GiB workspace; that comparison remains incomplete.
 
 The native source passed [container CI and additional oracle tests](https://github.com/aniketbadole/databricks-shopping-sessions/actions/runs/44896512703).
 
-The current native rewrite has not yet received an official score. Local
+The latest cache/counter revision has not yet received an official score. Local
 measurements use an Intel Xeon Platinum 8573C with eight workers; they include
 process startup, CSV reads, calculations and Parquet writes. Generation and
 comparison are outside the timing. They do not reproduce the scorer's exact
