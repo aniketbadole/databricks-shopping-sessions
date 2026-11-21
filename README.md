@@ -106,6 +106,26 @@ Official user-reported practice scores:
 | `007005d66c62cf79ce4905dc6e1198c9556ccd09` | 10.07 s |
 | `fb17dddd1b2405c0d0b9fccf1e8006e465ff748c` | 6.68 s |
 
+Local alternating 20M benchmark runs in the same session:
+
+| Implementation | Runs (seconds) | Median |
+| --- | --- | ---: |
+| Previous `fb17dddd` source | 9.183, 8.117, 6.944 | 8.117 s |
+| Native rewrite | 3.280, 3.672, 3.260 | 3.280 s |
+
+The previous implementation measured 6.142 s in an earlier session, illustrating
+local timing/cache variability. These results are not a promised hidden score.
+
+A full-size seed-29 run (60M requested events, 15M clicks) completed in **16.128 s**
+with **6,995.6 MiB peak child process RSS**. It wrote 6,639,553 user rows and
+28,014 campaign rows. Session and revenue totals agreed across tables, and the
+assist-count consistency check passed. There is no public expected answer for
+this seed. A full-output comparison with the previous implementation was
+attempted but interrupted after it stopped making progress for several minutes
+on this approximately 9.7 GiB workspace; that comparison remains incomplete.
+
+The native source passed [container CI and additional oracle tests](https://github.com/aniketbadole/databricks-shopping-sessions/actions/runs/44896512703).
+
 The current native rewrite has not yet received an official score. Local
 measurements use an Intel Xeon Platinum 8573C with eight workers; they include
 process startup, CSV reads, calculations and Parquet writes. Generation and
