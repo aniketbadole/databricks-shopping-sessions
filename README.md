@@ -29,11 +29,12 @@ Process RSS is not the same as total container memory accounting. The 20M set
 has no published expected answer; only the correctness datasets listed above
 were compared exactly. Hidden practice submission remains necessary.
 
-Docker is unavailable in the development environment, so the supplied Dockerfile
-has not yet been built or exercised under the scorer's exact restrictions.
-A GitHub Actions workflow builds the image and runs the 36 fixtures under the
-scorer sandbox flags (with a smaller CI CPU/memory allocation). Its result must
-be checked separately. The image uses a portable x86-64 compile (no `-march=native`), uid 1000 and a
+The linux/amd64 Docker image was successfully built in GitHub Actions, and all
+36 fixtures passed inside containers with no network, a read-only root, uid 1000,
+a 64 MiB `/tmp`, and process/memory limits. CI used 2 CPUs and 6 GiB RAM; it was
+not a performance benchmark. [Successful container validation](https://github.com/aniketbadole/databricks-shopping-sessions/actions/runs/44893703769).
+
+The image uses a portable x86-64 compile (no `-march=native`), uid 1000 and a
 multi-stage build. It writes only to `/scratch` and `/output` at runtime.
 
 ## Build and check with Docker
