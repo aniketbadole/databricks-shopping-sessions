@@ -5,7 +5,36 @@ CSV parsing, deduplication, linked identities, sessions and attribution. Polars
 only serializes final aggregates to typed Parquet. No generated data, expected
 answers, precomputed results, or external services are used at runtime.
 
-## Validation recorded on 21 November 2026
+## Optimization update, 21 November 2026
+
+The original submission scored **10.07 seconds** on the organizer's practice
+run (user-reported result). The new implementation has not yet been scored.
+
+Same-session local 20M benchmarks, three runs per implementation:
+
+| Implementation | Runs (seconds) | Median |
+| --- | --- | ---: |
+| Original scored source | 8.476, 7.866, 7.779 | 7.866 s |
+| Optimized source | 6.142, 6.144, 5.668 | 6.142 s |
+
+This is about **22% lower elapsed time**, not a prediction of the hidden score.
+Optimized peak child RSS ranged from 4,066 to 4,198 MiB. This costs more memory
+than the original. Full 60M memory use remains unverified.
+
+Changes: balanced 4 MiB line-aligned input chunks; sequential single-pass event
+parsing; contiguous hash tables holding pointers into stable candidate arrays;
+cached person hashes for sorting, with exact string collision resolution; and
+a specialized parser for the specification's guaranteed-valid ingestion times.
+Invalid candidates are retained through deduplication, so a later valid copy
+cannot rescue an invalid earliest copy.
+
+Validation was repeated: all 36 fixtures, the exact 1M published answer and all
+four independent small-seed oracle comparisons passed. The entire 20M output
+also matched the original (2,242,393 user rows and 28,014 campaign rows).
+The earlier linked CI run covers the original source; check the latest Actions
+run for the optimized commit's container result.
+
+## Original baseline validation recorded on 21 November 2026
 
 - All **36/36** supplied edge-case fixtures passed.
 - Public dev set: seed 1, 1,000,000 requested events, 250,000 requested clicks.
@@ -85,10 +114,9 @@ on small datasets, not on the full benchmark.
    restricted dialect. A CR remains field data. No trimming or case folding.
 2. Resolve link components with union-by-size and path compression. Retain the
    byte-wise minimum ID, including IDs that have no events or clicks.
-3. Partition raw event lines by the hash of the exact event ID. In each
-   partition, discard malformed records, select the earliest ingestion, then
-   validate only that winner. Hash collisions never imply equality: the full
-   string is always compared.
+3. Parse balanced input chunks into candidate records and partition by exact
+   event-ID hash. Retain invalid candidates through earliest-ingestion selection,
+   then discard invalid winners. Full strings resolve all hash collisions.
 4. Validate timestamp structure, calendar dates, offsets, digit-only numbers,
    purchase ranges and the late-event boundary explicitly. No permissive date
    or CSV inference is used for inputs.

@@ -126,11 +126,13 @@ bool digits(SV s) {
   return true;
 }
 I number(SV s, I limit) {
-  if (!digits(s))
+  if (s.empty())
     return -1;
   I n = 0;
   for (char c : s) {
     int d = c - '0';
+    if (d < 0 || d > 9)
+      return -1;
     if (n > (limit - d) / 10)
       return -1;
     n = n * 10 + d;
@@ -173,6 +175,13 @@ I stamp(SV s) {
       offset = -offset;
   }
   return days(y, m, d) * DAY + (h * 3600 + mi * 60 + se) * 1000LL - offset;
+}
+// ingest_ts is guaranteed valid F1 by the input contract.
+I ingest_stamp(SV s) {
+  auto two = [&](int i) { return (s[i] - '0') * 10 + s[i + 1] - '0'; };
+  int y = two(0) * 100 + two(2);
+  return days(y, two(5), two(8)) * DAY +
+         (two(11) * 3600 + two(14) * 60 + two(17)) * 1000LL;
 }
 string date(I day) {
   I z = day + 719468;
@@ -228,13 +237,35 @@ struct DSU {
     return it == ids.end() ? s : names[parent[it->second]];
   }
 };
+// Cached hash orders persons cheaply; full bytes resolve collisions.
+struct Person {
+  SV name;
+  uint64_t hash = 0;
+  Person() = default;
+  Person(SV s) : name(s), hash(Hash{}(s)) {}
+  operator SV() const { return name; }
+  bool operator==(const Person &b) const {
+    return hash == b.hash &&
+           (name.data() == b.name.data() && name.size() == b.name.size() ||
+            name == b.name);
+  }
+  bool operator!=(const Person &b) const { return !(*this == b); }
+  bool operator<(const Person &b) const {
+    if (hash != b.hash)
+      return hash < b.hash;
+    if (name.data() == b.name.data() && name.size() == b.name.size())
+      return false;
+    return name < b.name;
+  }
+};
 struct Event {
-  SV user;
+  Person user;
   I ts;
   uint32_t price, cat;
 };
 struct Click {
-  SV user, id;
+  Person user;
+  SV id;
   I ts;
   uint32_t campaign;
 };
@@ -307,21 +338,79 @@ int main(int argc, char **argv) {
     // Split input into independent ID hash partitions. Full IDs are still
     // compared.
     vector<SV> ef = files(data / "events"), cf = files(data / "clicks");
-    using RawBuckets = array<vector<SV>, B>;
+    struct Candidate {
+      SV id;
+      I ingest;
+      Event event;
+    };
+    using RawBuckets = array<vector<Candidate>, B>;
     vector<RawBuckets> raw(threads);
+    // Divide on physical line boundaries, not files, to balance skewed shards.
+    auto chunks = [](const vector<SV> &fs) {
+      vector<SV> result;
+      for (SV f : fs) {
+        size_t begin = f.find('\n');
+        if (begin == SV::npos)
+          continue;
+        ++begin;
+        while (begin < f.size()) {
+          size_t end = min(begin + 4 * 1024 * 1024, f.size());
+          if (end < f.size()) {
+            end = f.find('\n', end);
+            if (end == SV::npos)
+              end = f.size();
+            else
+              ++end;
+          }
+          result.push_back(f.substr(begin, end - begin));
+          begin = end;
+        }
+      }
+      return result;
+    };
+    auto work = chunks(ef);
 #pragma omp parallel for schedule(dynamic)
-    for (size_t f = 0; f < ef.size(); f++) {
+    for (size_t f = 0; f < work.size(); f++) {
       auto &dest = raw[omp_get_thread_num()];
-      lines(ef[f], [&](SV l) {
-        auto pos = l.find(',');
-        if (pos == SV::npos)
-          return;
-        SV id = l.substr(0, pos);
-        if (!field(id) || id.empty())
-          return;
-        dest[Hash{}(id) % B].push_back(l);
-      });
+      SV input = work[f];
+      while (!input.empty()) {
+        size_t len = input.find('\n');
+        if (len == SV::npos)
+          len = input.size();
+        SV l = input.substr(0, len);
+        input.remove_prefix(min(len + 1, input.size()));
+        SV a[7];
+        if (!parse(l, a, 7) || a[0].empty())
+          continue;
+        I ing = ingest_stamp(a[3]);
+        Candidate row{a[0], ing, {{}, -1, 0, 0}};
+        auto validate = [&]() {
+          if (a[1].empty() || a[5].empty())
+            return;
+          I t = stamp(a[2]);
+          if (t < start || t >= end || ing - t > DAY)
+            return;
+          I price = 0;
+          if (a[4] == "purchase") {
+            price = number(a[6], 10000000);
+            if (price < 1)
+              return;
+          } else if (a[4] != "view" && a[4] != "cart")
+            return;
+          SV u = dsu.person(a[1]);
+          uint32_t cat = 0;
+          if (price) {
+            auto it = products.find(a[5]);
+            if (it != products.end())
+              cat = it->second;
+          }
+          row.event = {u, t, uint32_t(price), cat};
+        };
+        validate();
+        dest[Hash{}(a[0]) % B].push_back(row);
+      }
     }
+    log("events parsed");
     using EventBuckets = array<vector<Event>, B>;
     vector<EventBuckets> ev(threads);
 #pragma omp parallel for schedule(dynamic)
@@ -329,45 +418,25 @@ int main(int argc, char **argv) {
       size_t n = 0;
       for (auto &r : raw)
         n += r[b].size();
-      Map<Winner> keep;
-      keep.reserve(n);
-      for (auto &r : raw) {
-        for (SV l : r[b]) {
-          SV a[7];
-          if (!parse(l, a, 7) || a[0].empty())
-            continue;
-          I ing = stamp(a[3]);
-          auto [it, yes] = keep.emplace(a[0], Winner{l, ing});
-          if (!yes && ing < it->second.ingest)
-            it->second = {l, ing};
+      size_t capacity = 1;
+      while (capacity < n * 2 + 1)
+        capacity *= 2;
+      // Table stores indices/pointers into stable candidate arrays, not copies.
+      vector<const Candidate *> keep(capacity, nullptr);
+      for (auto &r : raw)
+        for (auto &row : r[b]) {
+          size_t pos = (Hash{}(row.id) / B) & (capacity - 1);
+          while (keep[pos] && keep[pos]->id != row.id)
+            pos = (pos + 1) & (capacity - 1);
+          if (!keep[pos] || row.ingest < keep[pos]->ingest)
+            keep[pos] = &row;
         }
-        vector<SV>().swap(r[b]);
-      }
       auto &dest = ev[omp_get_thread_num()];
-      for (auto &[id, w] : keep) {
-        SV a[7];
-        parse(w.line, a, 7);
-        if (a[1].empty() || a[5].empty())
-          continue;
-        I t = stamp(a[2]);
-        if (t < start || t >= end || w.ingest - t > DAY)
-          continue;
-        I price = 0;
-        if (a[4] == "purchase") {
-          price = number(a[6], 10000000);
-          if (price < 1)
-            continue;
-        } else if (a[4] != "view" && a[4] != "cart")
-          continue;
-        SV u = dsu.person(a[1]);
-        uint32_t cat = 0;
-        if (price) {
-          auto it = products.find(a[5]);
-          if (it != products.end())
-            cat = it->second;
-        }
-        dest[Hash{}(u) % B].push_back({u, t, uint32_t(price), cat});
-      }
+      for (auto row : keep)
+        if (row && row->event.ts != -1)
+          dest[row->event.user.hash % B].push_back(row->event);
+      for (auto &r : raw)
+        vector<Candidate>().swap(r[b]);
     }
     raw.clear();
     log("events parsed/deduplicated");
