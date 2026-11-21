@@ -34,7 +34,7 @@ check-dev:
 ## Native build and tests when Docker is unavailable
 .PHONY: native fixtures-native
 native:
-	g++ -O3 -DNDEBUG -std=c++17 -fopenmp src/main.cpp -o core
+	python3 scripts/build_native.py
 
 fixtures-native: native
 	mkdir -p scratch

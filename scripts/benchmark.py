@@ -10,7 +10,7 @@ from pathlib import Path
 os.environ.setdefault('SCRATCH_DIR', str(Path('scratch').resolve()))
 os.environ.setdefault('NCPU', '8')
 start = time.perf_counter()
-result = subprocess.run([sys.executable, 'pipeline/pipeline.py', *sys.argv[1:]])
+result = subprocess.run([str(Path('core').resolve()), *sys.argv[1:]])
 print(f'elapsed_seconds={time.perf_counter() - start:.3f} '
       f'peak_child_rss_mib={resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024:.1f}')
 sys.exit(result.returncode)

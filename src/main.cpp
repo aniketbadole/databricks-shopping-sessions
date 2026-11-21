@@ -1,14 +1,20 @@
 #include <algorithm>
 #include <array>
+#include <arrow/api.h>
+#include <arrow/io/api.h>
 #include <chrono>
 #include <cstring>
+#include <emmintrin.h>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <omp.h>
+#include <parquet/arrow/writer.h>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -93,23 +99,50 @@ bool field(SV &s) {
   return s.find('"') == SV::npos;
 }
 bool parse(SV s, SV *a, int n) {
-  for (int i = 0; i < n; i++) {
-    auto p = s.find(',');
-    if (i == n - 1) {
-      if (p != SV::npos)
+  size_t ends[8];
+  int count = 0, quotes = 0;
+  size_t i = 0;
+  const __m128i comma = _mm_set1_epi8(','), quote = _mm_set1_epi8('"');
+  for (; i + 16 <= s.size(); i += 16) {
+    __m128i v =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(s.data() + i));
+    unsigned c = _mm_movemask_epi8(_mm_cmpeq_epi8(v, comma));
+    unsigned q = _mm_movemask_epi8(_mm_cmpeq_epi8(v, quote));
+    quotes += __builtin_popcount(q);
+    while (c) {
+      if (count >= n - 1)
         return false;
-      a[i] = s;
-    } else {
-      if (p == SV::npos)
-        return false;
-      a[i] = s.substr(0, p);
-      s.remove_prefix(p + 1);
+      ends[count++] = i + __builtin_ctz(c);
+      c &= c - 1;
     }
-    if (!field(a[i]))
-      return false;
   }
-  return true;
+  for (; i < s.size(); i++) {
+    if (s[i] == '"')
+      quotes++;
+    if (s[i] == ',') {
+      if (count >= n - 1)
+        return false;
+      ends[count++] = i;
+    }
+  }
+  if (count != n - 1)
+    return false;
+  ends[count] = s.size();
+  size_t begin = 0;
+  int allowed = 0;
+  for (int j = 0; j < n; j++) {
+    a[j] = s.substr(begin, ends[j] - begin);
+    begin = ends[j] + 1;
+    if (!a[j].empty() && a[j][0] == '"') {
+      if (a[j].size() < 2 || a[j].back() != '"')
+        return false;
+      a[j] = a[j].substr(1, a[j].size() - 2);
+      allowed += 2;
+    }
+  }
+  return quotes == allowed;
 }
+
 I days(int y, unsigned m, unsigned d) {
   y -= m <= 2;
   int era = (y >= 0 ? y : y - 399) / 400;
@@ -198,18 +231,118 @@ string date(I day) {
   return b;
 }
 void quoted(ostream &o, SV s) { o << '"' << s << '"'; }
+struct IdCodec {
+  Map<uint64_t> overflow;
+  vector<SV> names;
+  mutex guard;
+  uint64_t encode(SV s) {
+    uint64_t value = 0;
+    if (s.size() <= 10) {
+      for (unsigned char c : s) {
+        unsigned d = c >= '0' && c <= '9'   ? c - '0' + 1
+                     : c >= 'A' && c <= 'Z' ? c - 'A' + 11
+                     : c >= 'a' && c <= 'z' ? c - 'a' + 37
+                     : c == '_'             ? 63
+                                            : 0;
+        if (!d) {
+          value = 0;
+          break;
+        }
+        value = (value << 6) | d;
+      }
+      if (value)
+        return value;
+    }
+    lock_guard<mutex> lock(guard);
+    auto [it, yes] = overflow.emplace(s, (1ULL << 63) | names.size());
+    if (yes)
+      names.push_back(s);
+    return it->second;
+  }
+  string name(uint64_t v) const {
+    if (v >> 63)
+      return string(names.at(v & ~(1ULL << 63)));
+    char buf[10];
+    int n = 0;
+    while (v) {
+      unsigned d = v & 63;
+      buf[n++] = d <= 10   ? '0' + d - 1
+                 : d <= 36 ? 'A' + d - 11
+                 : d <= 62 ? 'a' + d - 37
+                           : '_';
+      v >>= 6;
+    }
+    reverse(buf, buf + n);
+    return string(buf, n);
+  }
+} codec;
+uint64_t mix(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+struct NumericMap {
+  struct Slot {
+    uint64_t key = 0;
+    uint32_t value = 0;
+  };
+  vector<Slot> table = vector<Slot>(1024);
+  size_t used = 0;
+  void grow() {
+    auto old = move(table);
+    table.resize(old.size() * 2);
+    used = 0;
+    for (auto &s : old)
+      if (s.key)
+        insert(s.key, s.value);
+  }
+  pair<uint32_t *, bool> insert(uint64_t key, uint32_t value) {
+    if ((used + 1) * 10 > table.size() * 7)
+      grow();
+    size_t p = mix(key) & (table.size() - 1);
+    while (table[p].key && table[p].key != key)
+      p = (p + 1) & (table.size() - 1);
+    bool fresh = !table[p].key;
+    if (fresh) {
+      table[p] = {key, value};
+      used++;
+    }
+    return {&table[p].value, fresh};
+  }
+  const uint32_t *find(uint64_t key) const {
+    size_t p = mix(key) & (table.size() - 1);
+    while (table[p].key) {
+      if (table[p].key == key)
+        return &table[p].value;
+      p = (p + 1) & (table.size() - 1);
+    }
+    return nullptr;
+  }
+};
+struct Person {
+  uint64_t hash = 0;
+  Person() = default;
+  explicit Person(uint64_t v) : hash(v) {}
+  bool operator==(const Person &b) const { return hash == b.hash; }
+  bool operator!=(const Person &b) const { return hash != b.hash; }
+  bool operator<(const Person &b) const { return hash < b.hash; }
+};
 struct DSU {
-  Map<uint32_t> ids;
+  NumericMap ids;
   vector<uint32_t> parent, sz;
   vector<SV> names;
+  vector<uint64_t> canonical;
   uint32_t add(SV s) {
-    auto [it, newid] = ids.emplace(s, parent.size());
-    if (newid) {
-      parent.push_back(it->second);
+    auto [it, fresh] = ids.insert(codec.encode(s), parent.size());
+    uint32_t id = *it;
+    if (fresh) {
+      parent.push_back(id);
       sz.push_back(1);
       names.push_back(s);
     }
-    return it->second;
+    return id;
   }
   uint32_t root(uint32_t i) {
     while (parent[i] != i) {
@@ -229,33 +362,16 @@ struct DSU {
     names[x] = min(names[x], names[y]);
   }
   void finish() {
-    for (uint32_t i = 0; i < parent.size(); i++)
+    canonical.resize(parent.size());
+    for (uint32_t i = 0; i < parent.size(); i++) {
       parent[i] = root(i);
+      canonical[i] = codec.encode(names[parent[i]]);
+    }
   }
-  SV person(SV s) const {
-    auto it = ids.find(s);
-    return it == ids.end() ? s : names[parent[it->second]];
-  }
-};
-// Cached hash orders persons cheaply; full bytes resolve collisions.
-struct Person {
-  SV name;
-  uint64_t hash = 0;
-  Person() = default;
-  Person(SV s) : name(s), hash(Hash{}(s)) {}
-  operator SV() const { return name; }
-  bool operator==(const Person &b) const {
-    return hash == b.hash &&
-           (name.data() == b.name.data() && name.size() == b.name.size() ||
-            name == b.name);
-  }
-  bool operator!=(const Person &b) const { return !(*this == b); }
-  bool operator<(const Person &b) const {
-    if (hash != b.hash)
-      return hash < b.hash;
-    if (name.data() == b.name.data() && name.size() == b.name.size())
-      return false;
-    return name < b.name;
+  Person person(SV s) const {
+    uint64_t id = codec.encode(s);
+    auto it = ids.find(id);
+    return Person(it ? canonical[*it] : id);
   }
 };
 struct Event {
@@ -263,6 +379,39 @@ struct Event {
   I ts;
   uint32_t price, cat;
 };
+void sort_events(vector<Event> &events) {
+  if (events.size() < 128) {
+    sort(events.begin(), events.end(), [](const Event &a, const Event &b) {
+      return a.user < b.user || (a.user == b.user && a.ts < b.ts);
+    });
+    return;
+  }
+  vector<Event> temp(events.size());
+  I origin = events[0].ts;
+  for (auto &e : events)
+    origin = min(origin, e.ts);
+  for (int column = 0; column < 2; column++)
+    for (int shift = 0; shift < 64; shift += 8) {
+      array<size_t, 256> count{};
+      auto byte = [&](const Event &e) {
+        return unsigned(
+            ((column ? e.user.hash : uint64_t(e.ts - origin)) >> shift) & 255);
+      };
+      for (auto &e : events)
+        count[byte(e)]++;
+      if (*max_element(count.begin(), count.end()) == events.size())
+        continue;
+      size_t offset = 0;
+      for (auto &n : count) {
+        size_t old = n;
+        n = offset;
+        offset += old;
+      }
+      for (auto &e : events)
+        temp[count[byte(e)]++] = e;
+      events.swap(temp);
+    }
+}
 struct Click {
   Person user;
   SV id;
@@ -287,10 +436,33 @@ using Totals = unordered_map<uint64_t, Counts>;
 uint64_t key(uint32_t campaign, I day) {
   return (uint64_t(uint32_t(day)) << 32) | campaign;
 }
+void check(const arrow::Status &s) {
+  if (!s.ok())
+    throw runtime_error(s.ToString());
+}
+template <class T> T result(arrow::Result<T> r) {
+  if (!r.ok())
+    throw runtime_error(r.status().ToString());
+  return move(r).ValueOrDie();
+}
+shared_ptr<arrow::Array> finish(arrow::ArrayBuilder &b) {
+  return result(b.Finish());
+}
+void parquet_write(const filesystem::path &path,
+                   shared_ptr<arrow::Schema> schema,
+                   vector<shared_ptr<arrow::Array>> arrays) {
+  auto output = result(arrow::io::FileOutputStream::Open(path.string()));
+  parquet::WriterProperties::Builder props;
+  props.compression(parquet::Compression::SNAPPY);
+  check(parquet::arrow::WriteTable(*arrow::Table::Make(schema, arrays),
+                                   arrow::default_memory_pool(), output, 65536,
+                                   props.build()));
+  check(output->Close());
+}
 int main(int argc, char **argv) {
   try {
-    if (argc != 5)
-      throw runtime_error("usage: core DATA SCRATCH WINDOW_START WINDOW_END");
+    if (argc != 3)
+      throw runtime_error("usage: core DATA OUTPUT");
     auto started = chrono::steady_clock::now();
     auto log = [&](const char *s) {
       cerr << s << " "
@@ -300,7 +472,25 @@ int main(int argc, char **argv) {
     };
     filesystem::path data = argv[1], scratch = argv[2];
     filesystem::create_directories(scratch);
-    I start = stoll(argv[3]), end = stoll(argv[4]);
+    ifstream manifest_file(data / "manifest.json");
+    string manifest((istreambuf_iterator<char>(manifest_file)), {});
+    auto window = [&](string key) {
+      size_t p = manifest.find('"' + key + '"');
+      if (p == string::npos)
+        throw runtime_error("missing window key");
+      p = manifest.find(':', p);
+      p = manifest.find('"', p);
+      size_t q = manifest.find('"', p + 1);
+      if (p == string::npos || q == string::npos)
+        throw runtime_error("invalid manifest");
+      I t = stamp(SV(manifest).substr(p + 1, q - p - 1));
+      if (t < 0)
+        throw runtime_error("invalid window");
+      return t;
+    };
+    I start = window("window_start"), end = window("window_end");
+    filesystem::create_directories(scratch / "user_daily");
+    filesystem::create_directories(scratch / "campaign_daily");
     int threads = 8;
     if (auto p = getenv("NCPU"))
       threads = max(1, min(8, atoi(p)));
@@ -339,7 +529,7 @@ int main(int argc, char **argv) {
     // compared.
     vector<SV> ef = files(data / "events"), cf = files(data / "clicks");
     struct Candidate {
-      SV id;
+      uint64_t id;
       I ingest;
       Event event;
     };
@@ -383,7 +573,7 @@ int main(int argc, char **argv) {
         if (!parse(l, a, 7) || a[0].empty())
           continue;
         I ing = ingest_stamp(a[3]);
-        Candidate row{a[0], ing, {{}, -1, 0, 0}};
+        Candidate row{codec.encode(a[0]), ing, {{}, -1, 0, 0}};
         auto validate = [&]() {
           if (a[1].empty() || a[5].empty())
             return;
@@ -397,7 +587,7 @@ int main(int argc, char **argv) {
               return;
           } else if (a[4] != "view" && a[4] != "cart")
             return;
-          SV u = dsu.person(a[1]);
+          Person u = dsu.person(a[1]);
           uint32_t cat = 0;
           if (price) {
             auto it = products.find(a[5]);
@@ -407,7 +597,7 @@ int main(int argc, char **argv) {
           row.event = {u, t, uint32_t(price), cat};
         };
         validate();
-        dest[Hash{}(a[0]) % B].push_back(row);
+        dest[mix(row.id) % B].push_back(row);
       }
     }
     log("events parsed");
@@ -425,7 +615,7 @@ int main(int argc, char **argv) {
       vector<const Candidate *> keep(capacity, nullptr);
       for (auto &r : raw)
         for (auto &row : r[b]) {
-          size_t pos = (Hash{}(row.id) / B) & (capacity - 1);
+          size_t pos = (mix(row.id) / B) & (capacity - 1);
           while (keep[pos] && keep[pos]->id != row.id)
             pos = (pos + 1) & (capacity - 1);
           if (!keep[pos] || row.ingest < keep[pos]->ingest)
@@ -434,7 +624,7 @@ int main(int argc, char **argv) {
       auto &dest = ev[omp_get_thread_num()];
       for (auto row : keep)
         if (row && row->event.ts != -1)
-          dest[row->event.user.hash % B].push_back(row->event);
+          dest[mix(row->event.user.hash) % B].push_back(row->event);
       for (auto &r : raw)
         vector<Candidate>().swap(r[b]);
     }
@@ -455,8 +645,8 @@ int main(int argc, char **argv) {
         I t = stamp(a[3]);
         if (t < start - WEEK || t >= end)
           return;
-        SV u = dsu.person(a[1]);
-        dest[Hash{}(u) % B].push_back({u, a[0], t, it->second});
+        Person u = dsu.person(a[1]);
+        dest[mix(u.hash) % B].push_back({u, a[0], t, it->second});
       });
     }
     log("clicks parsed");
@@ -483,9 +673,7 @@ int main(int argc, char **argv) {
         c.insert(c.end(), v[b].begin(), v[b].end());
         vector<Click>().swap(v[b]);
       }
-      sort(e.begin(), e.end(), [](auto &a, auto &b) {
-        return a.user < b.user || (a.user == b.user && a.ts < b.ts);
-      });
+      sort_events(e);
       sort(c.begin(), c.end(), [](auto &a, auto &b) {
         if (a.user != b.user)
           return a.user < b.user;
@@ -493,8 +681,9 @@ int main(int argc, char **argv) {
           return a.ts < b.ts;
         return a.id > b.id;
       });
-      ofstream out(scratch / ("user-" + to_string(b) + ".csv"));
-      out << "user_id,day,sessions,events,revenue_cents,top_category\n";
+      arrow::StringBuilder out_user, out_category;
+      arrow::Date32Builder out_day;
+      arrow::Int64Builder out_sessions, out_events, out_revenue;
       vector<uint32_t> count(campaigns.size(), 0);
       unordered_set<uint32_t> active;
       vector<I> category(cats.size(), 0);
@@ -513,9 +702,11 @@ int main(int argc, char **argv) {
         auto flush = [&]() {
           if (daily < 0)
             return;
-          quoted(out, e[u].user);
-          out << ',' << date(daily) << ',' << ns << ',' << nev << ',' << rev
-              << ',';
+          check(out_user.Append(codec.name(e[u].user.hash)));
+          check(out_day.Append(daily));
+          check(out_sessions.Append(ns));
+          check(out_events.Append(nev));
+          check(out_revenue.Append(rev));
           I best = 0;
           uint32_t top = 0;
           for (uint32_t k = 0; k < cats.size(); k++) {
@@ -526,8 +717,9 @@ int main(int argc, char **argv) {
             }
           }
           if (best)
-            quoted(out, cats[top]);
-          out << '\n';
+            check(out_category.Append(cats[top]));
+          else
+            check(out_category.AppendNull());
         };
         for (size_t s = u; s < ue;) {
           size_t se = s + 1;
@@ -575,27 +767,47 @@ int main(int argc, char **argv) {
         ci = ce;
         u = ue;
       }
-      if (!out)
-        throw runtime_error("write user CSV");
+      parquet_write(
+          scratch / "user_daily" / ("part-" + to_string(b) + ".parquet"),
+          arrow::schema({arrow::field("user_id", arrow::utf8()),
+                         arrow::field("day", arrow::date32()),
+                         arrow::field("sessions", arrow::int64()),
+                         arrow::field("events", arrow::int64()),
+                         arrow::field("revenue_cents", arrow::int64()),
+                         arrow::field("top_category", arrow::utf8())}),
+          {finish(out_user), finish(out_day), finish(out_sessions),
+           finish(out_events), finish(out_revenue), finish(out_category)});
     }
     log("sessions/attribution aggregated");
     Totals total;
     for (auto &t : totals)
       for (auto &[k, v] : t)
         total[k] += v;
-    ofstream out(scratch / "campaign.csv");
-    out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,"
-           "assisted_sessions\n";
+    arrow::StringBuilder out_campaign, out_channel;
+    arrow::Date32Builder out_day;
+    arrow::Int64Builder out_sessions, out_purchasing, out_revenue, out_assists;
     for (auto &[k, v] : total) {
       uint32_t id = uint32_t(k);
-      quoted(out, campaigns[id]);
-      out << ',';
-      quoted(out, channels[id]);
-      out << ',' << date(int32_t(k >> 32)) << ',' << v.sessions << ','
-          << v.purchasing << ',' << v.revenue << ',' << v.assists << '\n';
+      check(out_campaign.Append(campaigns[id]));
+      check(out_channel.Append(channels[id]));
+      check(out_day.Append(int32_t(k >> 32)));
+      check(out_sessions.Append(v.sessions));
+      check(out_purchasing.Append(v.purchasing));
+      check(out_revenue.Append(v.revenue));
+      check(out_assists.Append(v.assists));
     }
-    if (!out)
-      throw runtime_error("write campaign CSV");
+    parquet_write(
+        scratch / "campaign_daily" / "part-0.parquet",
+        arrow::schema({arrow::field("campaign_id", arrow::utf8()),
+                       arrow::field("channel", arrow::utf8()),
+                       arrow::field("day", arrow::date32()),
+                       arrow::field("sessions", arrow::int64()),
+                       arrow::field("purchasing_sessions", arrow::int64()),
+                       arrow::field("revenue_cents", arrow::int64()),
+                       arrow::field("assisted_sessions", arrow::int64())}),
+        {finish(out_campaign), finish(out_channel), finish(out_day),
+         finish(out_sessions), finish(out_purchasing), finish(out_revenue),
+         finish(out_assists)});
     log("core complete");
     return 0;
   } catch (exception &e) {

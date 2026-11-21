@@ -19,3 +19,7 @@ jobs:
           CPUS: '2'
           MEM: 6g
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Build native executable for additional oracle tests
+        run: make native
+      - name: Verify packed identifiers and exact fallback
+        run: python scripts/check_extra.py

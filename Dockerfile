@@ -1,17 +1,17 @@
-FROM debian:bookworm-slim AS build
+FROM python:3.12-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
-COPY src/main.cpp /build/main.cpp
-RUN g++ -O3 -DNDEBUG -std=c++17 -fopenmp /build/main.cpp -o /build/core
+RUN pip install --no-cache-dir pyarrow==26.0.1
+COPY src/main.cpp /build/src/main.cpp
+COPY scripts/build_native.py /build/scripts/build_native.py
+RUN python /build/scripts/build_native.py && mkdir /arrow && python -c "import pathlib,shutil,pyarrow; p=pathlib.Path(pyarrow.get_library_dirs()[0]); [shutil.copy(f,'/arrow') for pattern in ('libarrow.so.*','libparquet.so.*') for f in p.glob(pattern)]"
 
-FROM python:3.12-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/* && useradd --uid 1000 --no-create-home --home-dir /scratch app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /build/core /app/core
-COPY pipeline/ /app/pipeline/
+COPY --from=build /arrow/ /opt/arrow/
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 POLARS_MAX_THREADS=8
+ENV LD_LIBRARY_PATH=/opt/arrow
 WORKDIR /app
 USER 1000:1000
 CMD ["/app/run.sh"]

@@ -1,8 +1,7 @@
 *
 !Dockerfile
-!requirements.txt
 !run.sh
-!pipeline/
-!pipeline/pipeline.py
 !src/
 !src/main.cpp
+!scripts/
+!scripts/build_native.py
